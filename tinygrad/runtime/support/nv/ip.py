@@ -196,7 +196,11 @@ class NV_FLCN(NV_IP):
     self.falcon, self.sec2 = 0x00110000, 0x00840000
     if self.nvdev.is_usb:
       self.nvdev.pci_dev.retrain_pcie(1)
+      # The upload rate is the measured link rate that paces the GSP image stream (see stream_gsp_boot).
+      t0 = time.perf_counter()
       self.nvdev.pci_dev.usb.scsi_write(self.nvdev.gsp._boot_sram)
+      dt = time.perf_counter() - t0
+      if dt > 0: self.nvdev.pci_dev.f2_write_bps = len(self.nvdev.gsp._boot_sram) / dt
 
     self.reset(self.falcon)
     self.execute_hs(self.falcon, self.frts_image_paddr, code_off=0x0, data_off=self.desc_v3.IMEMLoadSize,
@@ -282,6 +286,8 @@ class NV_FLCN(NV_IP):
     self.start_cpu(base)
     if stream_gsp and self.nvdev.is_usb: self.nvdev.pci_dev.stream_gsp_boot(self.nvdev.gsp.gsp_image, time.perf_counter())
     self.wait_cpu_halted(base)
+    # The restore rewrites SRAM the booter reads (signature, radix tables), so it waits for the halt.
+    if stream_gsp and self.nvdev.is_usb: self.nvdev.pci_dev.restore_gsp_sram()
 
     if mailbox is not None:
       return self.nvdev.NV_PFALCON_FALCON_MAILBOX0.with_base(base).read(), self.nvdev.NV_PFALCON_FALCON_MAILBOX1.with_base(base).read()

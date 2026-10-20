@@ -2,7 +2,7 @@ from __future__ import annotations
 import time, functools, struct, tinygrad.runtime.autogen.nv_regs
 from typing import cast
 from tinygrad.helpers import getenv, DEBUG, getbits, round_up, ceildiv
-from tinygrad.runtime.autogen import pci
+from tinygrad.runtime.autogen import pci, libusb
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, VirtMapping, AddrSpace
 from tinygrad.runtime.support.nv.ip import NV_FLCN, NV_FLCN_COT, NV_GSP
 from tinygrad.runtime.support.system import PCIDevice, USBPCIDevice
@@ -159,22 +159,47 @@ class NVUSBPCIDevice(USBPCIDevice):
     linkctl = self.usb.pcie_cfg_req(0x90, bus=self.gpu_bus - 1, size=2)
     self.usb.pcie_cfg_req(0x90, bus=self.gpu_bus - 1, value=linkctl | 0x20, size=2)
     time.sleep(0.1)
+    # SEC2 reads controller SRAM through the upstream bridge during the image stream. Keep its requests at the smallest size.
+    if generation == 1:
+      devctl = self.usb.pcie_cfg_req(0x78 + 0x08, bus=self.gpu_bus, size=2)
+      self.usb.pcie_cfg_req(0x78 + 0x08, bus=self.gpu_bus, value=devctl & ~0x7000, size=2)
+
+  def restore_gsp_sram(self):
+    # The mirror covers all 512 KiB of SRAM, so this also zeroes the signature, bootloader and radix tables: call it only once SEC2 has halted.
+    if hasattr(self, "gsp_queues"): self.usb.scsi_write(bytes(self.gsp_queues._mirror))
+    for offset, page in self._gsp_args.items(): self.usb.write(0xB800 + offset, page)
 
   def stream_gsp_boot(self, image:bytes, launched_at:float):
+    # batch_pages divides ring_pages and is a multiple of 4, since the F2 engine addresses SRAM in 16 KiB (4-page) slots.
     ring_page, ring_pages, batch_pages = 44, 84, 28
     ring_size, batch_size = ring_pages * 0x1000, batch_pages * 0x1000
+    lead_s, base_period_s = 0.003, 0.0014
+    # Pace the stream from the measured link rate. SEC2 tracks the host and tolerates slow streams, but fails when the host runs
+    # fast, so ring demand is held to a fraction of what the link delivers and never goes faster than the known-good 1.4 ms.
+    # On 10 Gb/s USB3 this reproduces the fixed default, on 480 Mb/s USB2 it backs off to roughly 16x.
+    if (rate:=getattr(self, "f2_write_bps", 0.0)) > 0:
+      period_s = min(max(ring_size / (rate * 0.35), base_period_s), 64 * base_period_s)
+      if DEBUG >= 1: print(f"nv {self.pcibus}: link measured {rate/1e6:.1f} MB/s, stream period {period_s*1e3:.2f} ms ({period_s/base_period_s:.1f}x)")
+    else: period_s = base_period_s
+    # Chained SRAM OUT (0xF5) arms the DMA engine once for the whole stream and the 8051 re-arms each slot group itself. It is on
+    # below SuperSpeed only: a per-batch 0xF2 arm costs 1.13 ms on USB2 and leaves the engine idle for twice the ring's slack
+    # (0/15 boots), against 0.094 ms on USB3 (29/30 boots, versus 12/15 with 0xF5). Needs firmware carrying the 0xF5 handler.
+    use_f5 = getenv("USB_NV_STREAM_F5", 1 if self.usb.usb.speed < libusb.LIBUSB_SPEED_SUPER else 0)
+    nbatches = ceildiv(len(image) - ring_size, batch_size)
+    max_lag_s = 0.0
     for i, off in enumerate(range(ring_size, len(image), batch_size)):
-      deadline = launched_at + 0.003 + (off-ring_size) / ring_size * 0.0014
+      deadline = launched_at + lead_s + (off-ring_size) / ring_size * period_s
       if i == 0:
         while time.perf_counter() < deadline: pass
-      slot = ring_page // 4 + i % (ring_pages // batch_pages) * batch_pages // 4
-      self.usb.usb.control_write(0xF2, value=batch_size // 512, index=slot | (batch_pages // 4 << 8))
+      if use_f5:
+        if i == 0: self.usb.usb.control_write(0xF5, value=nbatches, index=(ring_page // 4) | ((batch_pages // 4) << 8))
+      else:
+        slot = ring_page // 4 + i % (ring_pages // batch_pages) * batch_pages // 4
+        self.usb.usb.control_write(0xF2, value=batch_size // 512, index=slot | (batch_pages // 4 << 8))
       while time.perf_counter() < deadline: pass
       self.usb.usb.bulk_write(image[off:off+batch_size].ljust(batch_size, b'\x00'))
-    # Restore queues and arguments after SEC2 verifies the image.
-    while time.perf_counter() < launched_at + 0.270: pass
-    self.usb.scsi_write(bytes(self.gsp_queues._mirror))
-    for offset, page in self._gsp_args.items(): self.usb.write(0xB800 + offset, page)
+      max_lag_s = max(max_lag_s, time.perf_counter() - deadline)
+    if DEBUG >= 1: print(f"nv {self.pcibus}: GSP stream {len(image):#x} bytes, {i+1} batches, max refill lag {max_lag_s * 1e3:.3f} ms")
 
   def map_bar(self, bar, off=0, addr=0, size=None, fmt='B'):
     bar_addr, bar_size = self.bar_info(bar)

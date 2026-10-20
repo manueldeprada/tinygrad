@@ -51,6 +51,13 @@ class USB3:
     self.product = bytes(_buf[:_ret]).decode("ascii", errors="replace")
     assert self.product.startswith("custom") or self.product.startswith("AS2462")
 
+    # The firmware's 0xE4 control-IN is capped by the endpoint-0 max packet size, which is 64
+    # bytes on High Speed and 512 on SuperSpeed. Chunking XDATA reads at 255 works on USB3 but
+    # every read over 64 bytes silently times out on USB2, so pick the chunk from the link speed.
+    self.speed = libusb.libusb_get_device_speed(libusb.libusb_get_device(self.handle))
+    self.max_ctrl_in = 0xFF if self.speed >= libusb.LIBUSB_SPEED_SUPER else 0x40
+    if DEBUG >= 2: print(f"usb: link speed {self.speed}, XDATA read chunk {self.max_ctrl_in}")
+
     # Detach kernel driver if needed
     if checked(libusb.libusb_kernel_driver_active)(self.handle, 0):
       checked(libusb.libusb_detach_kernel_driver)(self.handle, 0)
@@ -190,8 +197,9 @@ class CustomASM24Controller:
   def read(self, base_addr:int, length:int) -> bytes:
     """Read from chip XDATA via vendor control IN (bRequest=0xE4). wValue=addr, wLength=size."""
     result = b''
-    for off in range(0, length, 0xFF):
-      chunk = min(0xFF, length - off)
+    step = getattr(self.usb, "max_ctrl_in", 0xFF)
+    for off in range(0, length, step):
+      chunk = min(step, length - off)
       result += self.usb.control_read(0xE4, chunk, value=base_addr + off)
     return result
 

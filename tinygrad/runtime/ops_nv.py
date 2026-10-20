@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, ctypes, contextlib, re, functools, mmap, struct, array, sys, weakref
+import os, ctypes, contextlib, re, functools, mmap, struct, array, sys, weakref, time
 assert sys.platform != 'win32'
 from typing import cast
 from dataclasses import dataclass
@@ -8,7 +8,7 @@ from tinygrad.runtime.support.hcq import MMIOInterface, FileIOInterface, hcq_fil
 from tinygrad.uop.ops import sint
 from tinygrad.device import Compiled, BufferSpec, TinyELF
 from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent
-from tinygrad.helpers import TracingKey
+from tinygrad.helpers import TracingKey, ceildiv, DEBUG
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
@@ -348,10 +348,86 @@ class NVProgram(HCQProgram['NVDevice']):
         Compiled.profile_events += [ProfilePMAEvent(self.dev.device, self.name, pma_blob, self.dev.prof_exec_counter, self.profile_key)]
     return res
 
+class _SemAddr:
+  """Minimal stand-in for an HCQSignal: NVCommandQueue.wait only reads .value_addr."""
+  def __init__(self, addr:int): self.value_addr = addr
+
+USB_PIPELINE_WINDOWS, USB_PIPELINE_RING = 2, 64  # SRAM staging windows, copy-ring chunks per submission
+
 class NVAllocator(HCQAllocator['NVDevice']):
   def __init__(self, dev:NVDevice):
     super().__init__(dev, copy_bufs=dev.iface.copy_bufs if dev.is_usb() else None,
                      supports_transfer=not dev.is_usb())
+
+  def _usb_pipeline_state(self):
+    """Lazily set up the streaming windows: zero them so stale bytes cannot satisfy a sentinel,
+    and allocate a CPU-visible VRAM word the copy engine bumps as it drains each chunk."""
+    if getattr(self, "_pl", None) is None:
+      iface, usb = self.dev.iface, self.dev.iface.pci_dev.usb
+      nwin, wsize = USB_PIPELINE_WINDOWS, USBIface.TRANSFER_SLOT_COUNT // USB_PIPELINE_WINDOWS * USBIface.SLOT_SIZE
+      wins = [iface.copyout_buf.offset(w * wsize, wsize) for w in range(nwin)]
+      slots = [USBIface.TRANSFER_START_SLOT + w * (wsize // USBIface.SLOT_SIZE) for w in range(nwin)]
+      for s in slots: usb.scsi_write(bytes(wsize), slot_start=s)
+      prog = iface.alloc(0x1000, cpu_access=True, uncached=True, zero=True)
+      self._pl, self._usb_seq = (wins, slots, prog, prog.view.view(0, 4, fmt='I')), 0
+    return self._pl
+
+  # Streaming copyin. The per-chunk cost of the generic path is dominated by USB round trips: an
+  # F2 arm plus a whole copy-queue submission per chunk (~0.56 ms of the ~1.32 ms spent on a
+  # 400 KiB chunk). Here the entire copy ring is built and submitted once; each chunk's copy is
+  # gated by a 64-bit sentinel that the host writes as the last 8 bytes of that chunk's wire
+  # image, so the F2 engine's own sequential write ordering signals data arrival. The host then
+  # streams chunks back-to-back with no per-chunk queue work.
+  def _copyin(self, dest:HCQBuffer, src:memoryview):
+    if not self.dev.is_usb() or src.nbytes == 0: return super()._copyin(dest, src)
+    dev, usb, ts = self.dev, self.dev.iface.pci_dev.usb, self.dev.timeline_signal
+    wins, slots, _prog, prog_view = self._usb_pipeline_state()
+    nwin, wsize = len(wins), wins[0].size
+    chunk = wsize - 8  # the trailing 8 bytes of every wire image are the sentinel
+    # _copyout stages through the same SRAM region, so it leaves arbitrary bytes where the
+    # sentinels live. A stale value there can satisfy a later acquire and the engine would copy a
+    # window the host has not filled yet, so re-zero the windows whenever they have been touched.
+    if getattr(self, "_pl_dirty", False):
+      for s in slots: usb.scsi_write(bytes(wsize), slot_start=s)
+      self._pl_dirty = False
+    nslots = wsize // USBIface.SLOT_SIZE
+    src_mv, base_seq = src.cast('B'), self._usb_seq
+    nchunks = ceildiv(src.nbytes, chunk)
+
+    cached = 0
+    # One staging buffer per window so a bulk OUT can still be in flight while the next is filled.
+    stages, inflight = [bytearray(wsize) for _ in range(nwin)], [None] * nwin
+    with hcq_profile(self.dev, queue_type=self.dev.hw_copy_queue_t, desc=TracingKey(f"TINY -> {self.dev.device}", ret=src.nbytes), enabled=PROFILE,
+                     dev_suff="SDMA:0"):
+      # Rings are built in bounded groups so a very large copy cannot grow one unbounded command
+      # buffer. Groups still chain through the timeline, so no extra synchronization is needed.
+      for g0 in range(0, nchunks, USB_PIPELINE_RING):
+        g1 = min(g0 + USB_PIPELINE_RING, nchunks)
+        q = NVCopyQueue().wait(ts, dev.timeline_value - 1)
+        for c in range(g0, g1):
+          seq, size = base_seq + c, min(chunk, src.nbytes - c * chunk)
+          q.wait(_SemAddr(wins[seq % nwin].va_addr + wsize - 8), seq + 1)
+          q.copy(dest.offset(c * chunk), wins[seq % nwin], size)
+          q.write(_prog, seq + 1)
+        q.signal(ts, dev.next_timeline()).submit(dev)
+
+        for c in range(g0, g1):
+          seq, size, w = base_seq + c, min(chunk, src.nbytes - c * chunk), (base_seq + c) % nwin
+          # A window is reusable once the engine has drained its previous occupant, seq-nwin.
+          if (need:=seq - nwin + 1) > 0 and cached < need:
+            t0 = time.perf_counter()
+            while (cached:=prog_view[0]) < need:
+              if time.perf_counter() - t0 > 10: raise RuntimeError(f"GPU failed to drain USB copyin chunk {need-1} (10s, hung GPU?)")
+          if inflight[w] is not None: usb.usb.bulk_wait(inflight[w]); inflight[w] = None
+          buf = stages[w]
+          buf[:size] = src_mv[c * chunk:c * chunk + size]
+          if size < chunk: buf[size:chunk] = bytes(chunk - size)
+          struct.pack_into('<Q', buf, wsize - 8, seq + 1)
+          usb.usb.bulk_wait(usb.usb.control_write_async(0xF2, value=wsize // 512, index=slots[w] | (nslots << 8)))
+          inflight[w] = usb.usb.bulk_write_async(memoryview(buf))
+      for t in inflight:
+        if t is not None: usb.usb.bulk_wait(t)
+      self._usb_seq = base_seq + nchunks
 
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
     return self.dev.iface.alloc(size, cpu_access=options.cpu_access, host=options.host, zero=options.zero)
@@ -369,9 +445,12 @@ class NVAllocator(HCQAllocator['NVDevice']):
 
     with hcq_profile(self.dev, queue_type=self.dev.hw_copy_queue_t, desc=TracingKey(f"{self.dev.device} -> TINY", ret=dest.nbytes), enabled=PROFILE,
                      dev_suff="SDMA:0"):
-      for i in range(0, dest.nbytes, self.b[0].size):
+      cob = self.dev.iface.copyout_buf
+      if dest.nbytes > cob.size:
+        return self._copyout_ring(dest, src, cob, release_word, prefix_size)
+      for i in range(0, dest.nbytes, cob.size):
         queue = NVCopyQueue().wait(self.dev.timeline_signal, self.dev.timeline_value - 1) \
-                             .copy(self.b[0], src.offset(i), lsize:=min(self.b[0].size, dest.nbytes - i)) \
+                             .copy(cob, src.offset(i), lsize:=min(cob.size, dest.nbytes - i)) \
                              .write(release_word, 0)
 
         read_size = prefix_size + lsize
@@ -379,6 +458,38 @@ class NVAllocator(HCQAllocator['NVDevice']):
         queue.submit(self.dev)
         sram_window = self.dev.iface.pci_dev.usb.usb.bulk_read(round_up(read_size, 512))
         dest.cast('B')[i:i+lsize] = sram_window[prefix_size:read_size]
+    self._pl_dirty = True  # the staging SRAM (and any pipeline sentinels in it) is now clobbered
+
+  # Streaming copyout. Reads must be armed from slot 0, so a second staging window would sit
+  # behind an even larger discarded prefix and true overlap is not available. What is available is
+  # removing the per-chunk copy-queue submission: the ring is submitted once and each chunk's copy
+  # waits on a semaphore the host bumps over BAR1 (one 8-byte write) after it has armed the read
+  # and drained the previous chunk. Arming before the bump is what keeps the GPU's release write
+  # from firing at an unarmed endpoint, which would hang the bulk IN.
+  def _copyout_ring(self, dest:memoryview, src:HCQBuffer, cob:HCQBuffer, release_word:HCQBuffer, prefix_size:int):
+    dev, usb, ts = self.dev, self.dev.iface.pci_dev.usb, self.dev.timeline_signal
+    prog = self._usb_pipeline_state()[2]
+    sem_off = 0x40
+    sem_view = prog.view.view(sem_off, 8, fmt='B')
+    sem_view[:] = bytes(8)
+    nchunks = ceildiv(dest.nbytes, cob.size)
+
+    for g0 in range(0, nchunks, USB_PIPELINE_RING):
+      g1 = min(g0 + USB_PIPELINE_RING, nchunks)
+      q = NVCopyQueue().wait(ts, dev.timeline_value - 1)
+      for c in range(g0, g1):
+        q.wait(_SemAddr(prog.va_addr + sem_off), c + 1)
+        q.copy(cob, src.offset(c * cob.size), min(cob.size, dest.nbytes - c * cob.size))
+        q.write(release_word, 0)
+      q.signal(ts, dev.next_timeline()).submit(dev)
+
+      for c in range(g0, g1):
+        lsize = min(cob.size, dest.nbytes - c * cob.size)
+        usb.scsi_read_arm(read_size:=prefix_size + lsize)
+        sem_view[:] = struct.pack('<Q', c + 1)
+        window = usb.usb.bulk_read(round_up(read_size, 512))
+        dest.cast('B')[c * cob.size:c * cob.size + lsize] = window[prefix_size:read_size]
+    self._pl_dirty = True
 
   def _encode_decode(self, bufout:HCQBuffer, bufin:HCQBuffer, desc_buf:HCQBuffer, hist:list[HCQBuffer], shape:tuple[int,...], frame_pos:int):
     assert all(h.va_addr % 0x100 == 0 for h in hist + [bufin, bufout, desc_buf]), "all buffers must be 0x100 aligned"
@@ -619,18 +730,36 @@ class PCIIface(PCIIfaceBase):
 
 class USBIface(PCIIface):
   SRAM_PADDR, SLOT_SIZE = 0x200000, 0x4000
-  TRANSFER_START_SLOT, TRANSFER_SLOT_COUNT = 5, 25
+  TRANSFER_START_SLOT, TRANSFER_SLOT_COUNT = 5, 25  # SRAM slots 5:30 avoid the fixed GSP queue aliases in slots 0, 4, 30, and 31
   TRANSFER_PADDR, TRANSFER_SIZE = SRAM_PADDR + TRANSFER_START_SLOT * SLOT_SIZE, TRANSFER_SLOT_COUNT * SLOT_SIZE
 
   def __init__(self, dev, dev_id): # pylint: disable=super-init-not-called
     visible = hcq_filter_visible_devices(USB3.list_devices(0xADD1, 0x0001) + USB3.list_devices(0x3801, 0x0001), "NV")
     self.dev, self.pci_dev, self.vram_bar, self.count = dev, NVUSBPCIDevice(*visible[dev_id]), 1, len(visible)
-    self.dev_impl = NVDev(self.pci_dev)
+    self.dev_impl = self._boot_dev_impl()
     self._init_nvd()
 
-    # SRAM slots 5:30 avoid the fixed GSP queue aliases in slots 0, 4, 30, and 31.
-    self.copy_bufs = [self._dma_region(ctrl_addr=0xf000, sys_addr=self.TRANSFER_PADDR, size=self.TRANSFER_SIZE)]
+    # One window for downloads, which must read from slot 0, so a single large chunk amortizes the discarded prefix.
+    # Uploads split it into USB_PIPELINE_WINDOWS windows (see NVAllocator._copyin).
+    self.copyout_buf = self._dma_region(ctrl_addr=0xf000, sys_addr=self.TRANSFER_PADDR, size=self.TRANSFER_SIZE)
+    self.copy_bufs = [self.copyout_buf]
     self.cq_buf = self._dma_region(ctrl_addr=0xb800, sys_addr=0x828000, size=0x1000)
+
+  # The GSP image is streamed into a 336 KiB aliased SRAM ring on a host timer, because neither the
+  # GPU nor the bridge exposes any consumer index to close the loop on. A host scheduling pause is
+  # therefore able to corrupt the ring, and measured boot success is ~80% per attempt (12/15 at two
+  # stream periods 8x apart, so the period is not the lever). Every observed failure leaves the GPU
+  # idle with a status in the SEC2 mailbox, and NVDev's own early init clears a stale WPR2 with an
+  # FLR, so simply reconstructing it retries the whole boot: 3 attempts reach 99.2% at that base
+  # rate and 5 reach 99.97%.
+  def _boot_dev_impl(self) -> NVDev:
+    for attempt in range(tries:=getenv("USB_NV_BOOT_TRIES", 5)):
+      try: return NVDev(self.pci_dev)
+      except (AssertionError, RuntimeError, TimeoutError) as e:
+        if attempt == tries - 1: raise
+        if DEBUG >= 1: print(f"nv {self.pci_dev.pcibus}: GSP boot attempt {attempt+1}/{tries} failed ({e}), retrying", flush=True)
+        time.sleep(0.5)
+    raise RuntimeError("unreachable")
 
   def _dma_region(self, ctrl_addr, sys_addr, size):
     region = self.dev_impl.mm.map_range(vaddr:=self.dev_impl.mm.alloc_vaddr(size=size), size, [(sys_addr, size)], aspace=AddrSpace.SYS, uncached=True)
