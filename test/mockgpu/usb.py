@@ -234,7 +234,8 @@ def _alloc(n):
   _transfers.append(t:=libusb.struct_libusb_transfer())
   return ctypes.addressof(t)
 _mocked:list[tuple[Any, Callable]] = [(libusb.libusb_control_transfer, _control), (libusb.libusb_bulk_transfer, _bulk),
-  (libusb.libusb_submit_transfer, _submit), (libusb.libusb_handle_events_timeout, lambda ctx, tv: 0), (libusb.libusb_alloc_transfer, _alloc)]
+  (libusb.libusb_submit_transfer, _submit), (libusb.libusb_handle_events_timeout, lambda ctx, tv: 0), (libusb.libusb_alloc_transfer, _alloc),
+  (libusb.libusb_get_device, lambda h: None), (libusb.libusb_get_device_speed, lambda dev: libusb.LIBUSB_SPEED_SUPER)]
 for _fn, _impl in _mocked:
-  setattr(libusb.dll, _fn.__name__, ctypes.CFUNCTYPE(ctypes.c_void_p if _fn is libusb.libusb_alloc_transfer else _fn.restype, *_fn.argtypes)(_impl))
+  setattr(libusb.dll, _fn.__name__, ctypes.CFUNCTYPE(ctypes.c_void_p if _fn in (libusb.libusb_alloc_transfer, libusb.libusb_get_device) else _fn.restype, *_fn.argtypes)(_impl))
 libusb.dll._loaded_[libusb.dll.nm] = libusb.dll

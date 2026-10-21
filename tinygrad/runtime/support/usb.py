@@ -158,8 +158,9 @@ class CustomASM24Controller:
   def read(self, base_addr:int, length:int) -> bytes:
     """Read from chip XDATA via vendor control IN (bRequest=0xE4). wValue=addr, wLength=size."""
     result = b''
-    for off in range(0, length, 0xFF):
-      chunk = min(0xFF, length - off)
+    step = 0xFF if libusb.libusb_get_device_speed(libusb.libusb_get_device(self.usb.handle)) >= libusb.LIBUSB_SPEED_SUPER else 0x40
+    for off in range(0, length, step):
+      chunk = min(step, length - off)
       result += self.usb.control_read(0xE4, chunk, value=base_addr + off)
     return result
 
